@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace SignedUpdater;
 
 public enum UpdateStatus { Disabled, UpToDate, Available, Staged, Failed }
@@ -25,4 +27,7 @@ public sealed class ReleaseManifest
     public string? Sha256 { get; set; }   // hex SHA-256 of the executable
     public long Size { get; set; }        // bytes (optional; if 0 the MaxBytes cap applies)
     public string? Notes { get; set; }
+    /// <summary>UTC moment after which this manifest is refused (ISO 8601). It is signed with the rest, so it cannot be moved or removed.</summary>
+    [JsonPropertyName("expires_at")]
+    public DateTimeOffset? ExpiresAt { get; set; }
 }

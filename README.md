@@ -22,7 +22,7 @@ if (info.Status == UpdateStatus.Available)
 
 ## How it protects users
 
-1. The release carries `release.json` (version, file name, SHA-256, size) and `release.sig`
+1. The release carries `release.json` (version, file name, SHA-256, size, optional expiry) and `release.sig`
    (base64 **ECDSA P-256** over the exact manifest bytes).
 2. The app checks the signature with the public key it ships with. The private key never
    touches GitHub or CI, so a **hijacked GitHub account cannot ship a binary the app will run**.
@@ -48,8 +48,14 @@ File.WriteAllText("release.sig", Convert.ToBase64String(SignatureVerifier.Sign(m
 `release.json`:
 
 ```json
-{ "version": "2.0.0", "file": "yourapp.exe", "sha256": "<hex>", "size": 123456, "notes": "What changed" }
+{ "version": "2.0.0", "file": "yourapp.exe", "sha256": "<hex>", "size": 123456, "notes": "What changed",
+  "expires_at": "2027-02-01T00:00:00Z" }
 ```
+
+`expires_at` is optional and is covered by the signature. After that moment the updater refuses the manifest
+(`UpdateStatus.Failed`), so a stale release cannot be served forever. Set `UpdaterOptions.RequireExpiry = true`
+to refuse manifests that have no expiry at all. The trade-off is operational: you must publish a freshly signed
+manifest before the old one lapses, or clients stop updating until you do.
 
 Upload `yourapp.exe`, `release.json` and `release.sig` as assets of the release.
 
@@ -58,8 +64,10 @@ Upload `yourapp.exe`, `release.json` and `release.sig` as assets of the release.
 - **Stage directory trust.** `TryApplyStaged` verifies the file, then runs a script that moves it. If a
   local unprivileged user can write to `stageDir`, they can race that gap. Use a folder only administrators can
   write to (for example under `Program Files`, or an ACL-hardened ProgramData folder).
-- **Rollback protection is version-based**: only strictly newer versions install. It does not stop an attacker
-  who holds an old signed release from replaying it as long as its version is newer than the installed one.
+- **Rollback protection is version-based**: only strictly newer versions install, so a replayed old release can
+  never downgrade a client. What an attacker who holds an old signed release *can* do is serve it to a client on an
+  even older version, or keep serving it so the client never learns about a newer security fix (a freeze attack).
+  `expires_at` bounds that window; it does not remove it, and it only works if you actually set it.
 - **Key rotation is not built in.** If the private key leaks you must ship a new build with a new public key
   through another channel.
 - It does not code-sign the exe. Authenticode is a separate layer (SmartScreen, enterprise policy) and is
@@ -69,10 +77,11 @@ Upload `yourapp.exe`, `release.json` and `release.sig` as assets of the release.
 ## Develop
 
 ```bash
-dotnet test tests/SignedUpdater.Tests    # 13 tests, in-memory fake GitHub, no network
+dotnet test tests/SignedUpdater.Tests    # 17 tests, in-memory fake GitHub, no network
 ```
 
-Tests cover: valid flow, wrong-key signature, tampered manifest, swapped exe with a valid manifest, oversize
+Tests cover: valid flow, wrong-key signature, tampered manifest, swapped exe with a valid manifest, an expired
+manifest that is correctly signed, an expiry that cannot be extended without breaking the signature, oversize
 streaming abort, non-allow-listed host (never contacted), plain HTTP, disabled state, garbage keys, discarding a
 corrupt or not-newer staged file, and the swap script (backup, rollback, `%` escaping).
 

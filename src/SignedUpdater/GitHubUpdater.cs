@@ -19,6 +19,13 @@ public sealed class UpdaterOptions
     public long MaxBytes { get; set; } = 400L * 1024 * 1024;
     public string PendingExeName { get; set; } = "app.pending.exe";
     public string PendingInfoName { get; set; } = "pending.json";
+    /// <summary>
+    /// When true, a manifest without a signed <c>expires_at</c> is refused. When false (default) a manifest that
+    /// has one is still checked, but one without it is accepted for backward compatibility.
+    /// </summary>
+    public bool RequireExpiry { get; set; }
+    /// <summary>Time source for the expiry check. For tests; defaults to the system clock.</summary>
+    public TimeProvider Clock { get; set; } = TimeProvider.System;
     /// <summary>For tests: replaces the HTTP stack.</summary>
     public HttpMessageHandler? Handler { get; set; }
 }
@@ -101,6 +108,14 @@ public sealed class GitHubUpdater
                 || string.IsNullOrWhiteSpace(m.Sha256) || string.IsNullOrWhiteSpace(m.File))
                 return Fail("Invalid release manifest.");
             if (m.Size < 0 || m.Size > _o.MaxBytes) return Fail("The size declared in the manifest is not valid.");
+
+            // Freeze protection: someone who holds an old signed manifest cannot keep serving it forever,
+            // because the expiry is covered by the signature. Publishers must re-sign before it lapses.
+            if (m.ExpiresAt is { } expiresAt)
+            {
+                if (expiresAt <= _o.Clock.GetUtcNow()) return Fail("The signed release manifest has expired: ignored.");
+            }
+            else if (_o.RequireExpiry) return Fail("The release manifest has no expiry date: ignored.");
 
             // The exe is looked up by the SIGNED name, not by whatever GitHub lists first.
             var exeUrl = UrlOfAsset(indexJson, m.File);

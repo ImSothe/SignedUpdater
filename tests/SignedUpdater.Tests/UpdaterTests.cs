@@ -24,6 +24,12 @@ internal sealed class FakeGitHub : HttpMessageHandler
     private static HttpResponseMessage Ok(byte[] b) => new(HttpStatusCode.OK) { Content = new ByteArrayContent(b) };
 }
 
+/// <summary>A clock that always says the same moment, so expiry tests do not depend on the machine date.</summary>
+internal sealed class FixedClock(DateTimeOffset now) : TimeProvider
+{
+    public override DateTimeOffset GetUtcNow() => now;
+}
+
 public class UpdaterTests : IDisposable
 {
     private const string Base = "https://github.com/me/app-releases/releases/download/v2/";
@@ -37,13 +43,16 @@ public class UpdaterTests : IDisposable
     private string Sha(byte[] b) => Convert.ToHexString(SHA256.HashData(b));
 
     private FakeGitHub Release(string version = "2.0.0", byte[]? exe = null, string? signWith = null,
-        long? size = null, string? sha = null, string baseUrl = Base, string file = "app.exe")
+        long? size = null, string? sha = null, string baseUrl = Base, string file = "app.exe",
+        DateTimeOffset? expires = null)
     {
         exe ??= _exe;
-        var manifest = JsonSerializer.SerializeToUtf8Bytes(new
+        var fields = new Dictionary<string, object>
         {
-            version, file, sha256 = sha ?? Sha(_exe), size = size ?? exe.Length, notes = "n"
-        });
+            ["version"] = version, ["file"] = file, ["sha256"] = sha ?? Sha(_exe), ["size"] = size ?? exe.Length, ["notes"] = "n",
+        };
+        if (expires is { } e) fields["expires_at"] = e.ToString("O");
+        var manifest = JsonSerializer.SerializeToUtf8Bytes(fields);
         var sig = Convert.ToBase64String(SignatureVerifier.Sign(manifest, signWith ?? _priv));
         var gh = new FakeGitHub();
         gh.IndexJson = JsonSerializer.Serialize(new
@@ -61,8 +70,13 @@ public class UpdaterTests : IDisposable
         return gh;
     }
 
-    private GitHubUpdater Updater(FakeGitHub gh, string current = "1.0.0", string? key = null) =>
-        new(Version.Parse(current), new UpdaterOptions { Repo = "me/app-releases", PublicKey = key ?? _pub, Handler = gh });
+    private GitHubUpdater Updater(FakeGitHub gh, string current = "1.0.0", string? key = null,
+        bool requireExpiry = false, DateTimeOffset? now = null) =>
+        new(Version.Parse(current), new UpdaterOptions
+        {
+            Repo = "me/app-releases", PublicKey = key ?? _pub, Handler = gh, RequireExpiry = requireExpiry,
+            Clock = now is { } n ? new FixedClock(n) : TimeProvider.System,
+        });
 
     [Fact]
     public async Task ValidRelease_IsAvailable_ThenDownloadsAndStages()
@@ -113,6 +127,50 @@ public class UpdaterTests : IDisposable
         Assert.Equal(UpdateStatus.Failed, res.Status);
         Assert.False(File.Exists(Path.Combine(_stage, "app.pending.exe")));
         Assert.False(File.Exists(Path.Combine(_stage, "app.pending.exe.part")));
+    }
+
+    private static readonly DateTimeOffset Now = new(2026, 11, 7, 12, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public async Task ExpiredManifest_IsRejected_EvenWithAValidSignature()
+    {
+        // An attacker replaying an old but genuinely signed release: the signature is fine, the expiry is not.
+        var gh = Release(expires: Now.AddDays(-1));
+        var info = await Updater(gh, now: Now).CheckAsync();
+        Assert.Equal(UpdateStatus.Failed, info.Status);
+        Assert.Contains("expired", info.Message);
+    }
+
+    [Fact]
+    public async Task ManifestBeforeItsExpiry_IsAvailable()
+    {
+        var info = await Updater(Release(expires: Now.AddDays(30)), now: Now).CheckAsync();
+        Assert.Equal(UpdateStatus.Available, info.Status);
+    }
+
+    [Fact]
+    public async Task ManifestWithoutExpiry_IsAcceptedByDefault_ButRefusedWhenExpiryIsRequired()
+    {
+        Assert.Equal(UpdateStatus.Available, (await Updater(Release(), now: Now).CheckAsync()).Status);
+        var strict = await Updater(Release(), requireExpiry: true, now: Now).CheckAsync();
+        Assert.Equal(UpdateStatus.Failed, strict.Status);
+        Assert.Contains("no expiry", strict.Message);
+    }
+
+    [Fact]
+    public async Task ExtendingTheExpiry_BreaksTheSignature()
+    {
+        // The expiry only protects anyone if it cannot be edited: moving it forward must invalidate release.sig.
+        var gh = Release(expires: Now.AddDays(-1));
+        var key = Base + "release.json";
+        var before = Encoding.UTF8.GetString(gh.Files[key]);
+        // Only the date part is replaced: the serializer escapes the "+" of the offset, so the full string would not match.
+        var after = before.Replace(Now.AddDays(-1).ToString("yyyy-MM-dd"), Now.AddDays(365).ToString("yyyy-MM-dd"));
+        Assert.NotEqual(before, after);   // guards against a test that "passes" because nothing was edited
+        gh.Files[key] = Encoding.UTF8.GetBytes(after);
+        var info = await Updater(gh, now: Now).CheckAsync();
+        Assert.Equal(UpdateStatus.Failed, info.Status);
+        Assert.Contains("signature", info.Message);
     }
 
     [Fact]
